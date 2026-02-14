@@ -1,50 +1,52 @@
 #!/usr/bin/env python3
 """
-install_collab.py — Colab installer for Depth-Anything-collab-notebook
+install_collab.py — minimal Colab installer (inference-only)
 
-- Colab-friendly: no venv.
-- Ensures ffmpeg exists.
-- Installs python deps from requirements*.txt if present, else minimal deps.
-- Clones Depth-Anything-V2 into ./Depth-Anything-V2 (expected by test_install.py).
-- Downloads official Depth Anything V2 checkpoints into ./checkpoints/:
+What it does (minimal):
+- Print env info (GPU, ffmpeg).
+- Ensure ffmpeg exists.
+- Optionally install ipywidgets + ipyfilechooser (for notebook UI).
+- Clone Depth-Anything-V2 into ./Depth-Anything-V2 (expected by test_install.py).
+- Download Depth-Anything-V2 checkpoints into ./checkpoints/ (expected by your converter):
     - depth_anything_v2_vits.pth
     - depth_anything_v2_vitb.pth
     - depth_anything_v2_vitl.pth
-- Prepares /content/jobs and /content/work.
+- Prepare /content/jobs and /content/work
+- Optional smoke test: torch cuda check + imports.
 
-Usage (in Colab):
+It intentionally DOES NOT install Depth-Anything-V2/requirements.txt (Gradio pins, numpy/websockets downgrades).
+It also avoids upgrading setuptools/wheel to reduce environment churn on Colab.
+
+Usage:
   !python install_collab.py --with-widgets --smoke-test
-  !python install_collab.py --models vitb        # only Base
-  !python install_collab.py --models all         # vits+vitb+vitl (default)
+  !python install_collab.py --models vitb
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Iterable
+from typing import Optional
 
 # --- Repo paths ---
 REPO_ROOT = Path(__file__).resolve().parent
 
 DEPTH_REPO_NAME = "Depth-Anything-V2"
 DEPTH_REPO_URL = "https://github.com/DepthAnything/Depth-Anything-V2.git"
-DEPTH_REPO_DIR = REPO_ROOT / DEPTH_REPO_NAME  # where test_install.py expects it
+DEPTH_REPO_DIR = REPO_ROOT / DEPTH_REPO_NAME
 
-# --- Runtime dirs (your pipeline uses these) ---
+# --- Runtime dirs ---
 JOBS_DIR = Path("/content/jobs")
 WORK_DIR = Path("/content/work")
 
 # --- Where your converter expects checkpoints ---
 REPO_CHECKPOINTS_DIR = REPO_ROOT / "checkpoints"
 
-# Official checkpoints (Small/Base/Large) hosted on Hugging Face
-# (keep URLs in code to avoid raw links in chat text)
+# Official checkpoints on Hugging Face (Small/Base/Large)
 CKPT_URLS = {
     "vits": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth?download=true",
     "vitb": "https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth?download=true",
@@ -56,15 +58,8 @@ CKPT_FILES = {
     "vitl": "depth_anything_v2_vitl.pth",
 }
 
-# Requirements file preference order (in your repo)
-REQUIREMENTS_CANDIDATES = [
-    REPO_ROOT / "requirements-colab.txt",
-    REPO_ROOT / "requirements_colab.txt",
-    REPO_ROOT / "requirements.txt",
-]
 
-
-def run(cmd: list[str] | str, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+def run(cmd: list[str] | str, check: bool = True) -> subprocess.CompletedProcess:
     if isinstance(cmd, str):
         shell = True
         printable = cmd
@@ -72,7 +67,7 @@ def run(cmd: list[str] | str, check: bool = True, env: dict | None = None) -> su
         shell = False
         printable = " ".join(cmd)
     print(f"\n🟦 RUN: {printable}")
-    return subprocess.run(cmd, shell=shell, check=check, env=env, text=True)
+    return subprocess.run(cmd, shell=shell, check=check, text=True)
 
 
 def which(exe: str) -> Optional[str]:
@@ -80,60 +75,40 @@ def which(exe: str) -> Optional[str]:
     return _which(exe)
 
 
-def is_colab() -> bool:
-    return os.path.exists("/content") and (
-        "COLAB_GPU" in os.environ or "google.colab" in sys.modules or "COLAB_RELEASE_TAG" in os.environ
-    )
-
-
 def print_env_info() -> None:
     print("\n🧾 Environment info")
-    print(" - timestamp:", datetime.utcnow().isoformat() + "Z")
+    print(" - timestamp:", datetime.now(timezone.utc).isoformat())
     print(" - python:", sys.version.replace("\n", " "))
     print(" - repo:", REPO_ROOT)
-    print(" - colab:", is_colab())
     print(" - ffmpeg:", which("ffmpeg") or "missing")
     print(" - nvidia-smi:", which("nvidia-smi") or "missing")
     if which("nvidia-smi"):
         run(["bash", "-lc", "nvidia-smi -L || true"], check=False)
 
 
-def apt_install_if_missing(args: argparse.Namespace) -> None:
-    if args.no_apt:
-        print("🟨 --no-apt set: skipping apt installs.")
-        return
+def ensure_ffmpeg(args: argparse.Namespace) -> None:
     if which("ffmpeg"):
         print("✅ ffmpeg found.")
         return
+    if args.no_apt:
+        raise SystemExit("ffmpeg not found and --no-apt was set.")
     print("🟨 ffmpeg not found → installing via apt-get...")
     run(["bash", "-lc", "apt-get update -y"])
     run(["bash", "-lc", "apt-get install -y ffmpeg"])
 
 
-def pip_install_base(args: argparse.Namespace) -> None:
-    # Upgrade pip toolchain only; avoid forcing torch in Colab (it comes preinstalled for GPU runtimes).
-    run([sys.executable, "-m", "pip", "install", "-U", "pip", "setuptools", "wheel"])
-
-    req_file = next((p for p in REQUIREMENTS_CANDIDATES if p.exists()), None)
-    if req_file:
-        print(f"✅ Using requirements file: {req_file}")
-        run([sys.executable, "-m", "pip", "install", "-r", str(req_file)])
-    else:
-        print("🟨 No requirements*.txt found in repo. Installing minimal dependency set.")
-        base = [
-            "pyyaml",
-            "tqdm",
-            "numpy",
-            "opencv-python",
-            "imageio",
-            "imageio-ffmpeg",
-            "yt-dlp",
-            "requests",
-        ]
-        run([sys.executable, "-m", "pip", "install", *base])
-
-    if args.with_widgets:
-        run([sys.executable, "-m", "pip", "install", "ipywidgets", "ipyfilechooser"])
+def ensure_widgets(args: argparse.Namespace) -> None:
+    if not args.with_widgets:
+        return
+    # Only install if missing (light touch)
+    try:
+        import ipywidgets  # noqa
+        import ipyfilechooser  # noqa
+        print("✅ widgets already installed.")
+        return
+    except Exception:
+        pass
+    run([sys.executable, "-m", "pip", "install", "-q", "ipywidgets", "ipyfilechooser"])
 
 
 def prepare_dirs() -> None:
@@ -149,46 +124,33 @@ def prepare_dirs() -> None:
 def ensure_depth_repo(args: argparse.Namespace) -> None:
     if DEPTH_REPO_DIR.exists():
         print(f"✅ {DEPTH_REPO_NAME} already present: {DEPTH_REPO_DIR}")
-    else:
-        if args.no_git:
-            raise SystemExit(f"Depth repo missing at {DEPTH_REPO_DIR} and --no-git was set.")
-        print(f"🟨 Cloning {DEPTH_REPO_NAME} into: {DEPTH_REPO_DIR}")
-        run(["bash", "-lc", f"git clone --depth 1 {DEPTH_REPO_URL} {DEPTH_REPO_DIR}"])
-
-    # Install Depth-Anything-V2 requirements if present
-    req = DEPTH_REPO_DIR / "requirements.txt"
-    if req.exists():
-        print(f"✅ Installing Depth-Anything-V2 requirements: {req}")
-        run([sys.executable, "-m", "pip", "install", "-r", str(req)])
-    else:
-        print("🟨 Depth-Anything-V2 requirements.txt not found (skipping).")
+        return
+    if args.no_git:
+        raise SystemExit(f"{DEPTH_REPO_NAME} missing and --no-git was set.")
+    print(f"🟨 Cloning {DEPTH_REPO_NAME} into: {DEPTH_REPO_DIR}")
+    run(["bash", "-lc", f"git clone --depth 1 {DEPTH_REPO_URL} {DEPTH_REPO_DIR}"])
 
 
 def download_file(url: str, dst: Path) -> None:
-    """
-    Robust downloader using curl if available (progress + resume),
-    else wget, else python requests (fallback).
-    """
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # If already there and non-trivial size, skip
-    if dst.exists() and dst.stat().st_size > 10_000_000:  # >10MB
+    # Skip if already downloaded and looks real (>10MB)
+    if dst.exists() and dst.stat().st_size > 10_000_000:
         print(f"✅ Already downloaded: {dst.name} ({dst.stat().st_size/1e6:.1f} MB)")
         return
 
     if which("curl"):
-        # -L follow redirects, -C - resume, --fail to error on HTTP errors, --progress-bar for progress
         run(["bash", "-lc", f'curl -L --fail -C - --progress-bar -o "{dst}" "{url}"'])
         return
     if which("wget"):
         run(["bash", "-lc", f'wget -c -O "{dst}" "{url}"'])
         return
 
-    # Fallback: python requests streaming
+    # Very rare fallback
+    run([sys.executable, "-m", "pip", "install", "-q", "requests"])
     import requests
     from tqdm import tqdm
 
-    print(f"🟨 Downloading (python): {url}")
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", "0") or 0)
@@ -204,15 +166,13 @@ def download_file(url: str, dst: Path) -> None:
 
 def resolve_models_selection(sel: str) -> list[str]:
     sel = (sel or "").strip().lower()
-    if sel in ("all", "common", ""):
+    if sel in ("all", ""):
         return ["vits", "vitb", "vitl"]
     parts = [p.strip() for p in sel.replace(",", " ").split() if p.strip()]
-    ok = []
     for p in parts:
         if p not in CKPT_URLS:
             raise SystemExit(f"Unknown model '{p}'. Use: vits, vitb, vitl, all")
-        ok.append(p)
-    return ok
+    return parts
 
 
 def ensure_checkpoints(args: argparse.Namespace) -> None:
@@ -225,7 +185,6 @@ def ensure_checkpoints(args: argparse.Namespace) -> None:
         dst = REPO_CHECKPOINTS_DIR / fname
         download_file(url, dst)
 
-    # Quick listing
     print("\n📦 Checkpoints present:")
     for p in sorted(REPO_CHECKPOINTS_DIR.glob("depth_anything_v2_*.pth")):
         print(f" - {p.name} ({p.stat().st_size/1e6:.1f} MB)")
@@ -234,54 +193,43 @@ def ensure_checkpoints(args: argparse.Namespace) -> None:
 def smoke_test(args: argparse.Namespace) -> None:
     if not args.smoke_test:
         return
-    print("\n🧪 Smoke test: imports + torch/cuda check")
+    print("\n🧪 Smoke test: torch + cuda + minimal imports")
     code = r"""
-import sys
-print("python:", sys.version)
-mods = ["yaml","tqdm","numpy","cv2","imageio","requests"]
-for m in mods:
-    __import__(m)
-print("imports ok:", mods)
-
 import torch
 print("torch:", torch.__version__)
 print("cuda available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("gpu:", torch.cuda.get_device_name(0))
+
+import yaml, cv2, numpy, imageio, requests
+print("imports ok")
 """
     run([sys.executable, "-c", code], check=True)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Install dependencies & prepare workspace for Colab.")
-    ap.add_argument("--smoke-test", action="store_true", help="Run import checks and torch/cuda check.")
+    ap = argparse.ArgumentParser(description="Minimal Colab install (inference-only).")
+    ap.add_argument("--smoke-test", action="store_true", help="Run torch/cuda + imports check.")
+    ap.add_argument("--with-widgets", action="store_true", help="Install ipywidgets + ipyfilechooser if missing.")
     ap.add_argument("--no-apt", action="store_true", help="Skip apt-get installs (ffmpeg).")
-    ap.add_argument("--with-widgets", action="store_true", help="Install ipywidgets + ipyfilechooser.")
-    ap.add_argument("--no-git", action="store_true", help="Skip git clone for Depth-Anything-V2.")
-    ap.add_argument(
-        "--models",
-        default="all",
-        help="Which checkpoints to download: 'vits', 'vitb', 'vitl', or 'all' (default: all). Example: --models vitb",
-    )
+    ap.add_argument("--no-git", action="store_true", help="Skip git clone Depth-Anything-V2.")
+    ap.add_argument("--models", default="vitb", help="Which checkpoints to download: vits, vitb, vitl, all. Default: vitb.")
     args = ap.parse_args()
 
     print_env_info()
-    apt_install_if_missing(args)
-    pip_install_base(args)
+    ensure_ffmpeg(args)
+    ensure_widgets(args)
     prepare_dirs()
-
     ensure_depth_repo(args)
     ensure_checkpoints(args)
-
     smoke_test(args)
 
     print("\n✅ Colab install done.")
     print("Next steps:")
     print(f" - Depth repo: {DEPTH_REPO_DIR}")
-    print(f" - Checkpoints: {REPO_CHECKPOINTS_DIR}  (expected by your converter)")
+    print(f" - Checkpoints: {REPO_CHECKPOINTS_DIR} (expected by your converter)")
     print(f" - Jobs: {JOBS_DIR}")
     print(f" - Work: {WORK_DIR}")
-    print(" - Run: python test_install.py ... or python run_job.py ...")
 
 
 if __name__ == "__main__":
