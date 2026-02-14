@@ -148,6 +148,7 @@ def convert_to_sbs(
     out_cq: Optional[int],
     nv_preset: Optional[str],
     preview: bool,
+    converter_extra: Optional[List[str]] = None,
 ) -> None:
     help_text = converter_help(converter)
 
@@ -169,6 +170,11 @@ def convert_to_sbs(
         cmd += ["--cq", str(out_cq)]
     if nv_preset is not None and supports_flag(help_text, "--nv_preset"):
         cmd += ["--nv_preset", nv_preset]
+
+    # Forward any additional flags provided to this script that are meant for the converter
+    # (e.g. --fp16, --sbs_h, etc.). We don't validate them here.
+    if converter_extra:
+        cmd += list(converter_extra)
 
     # Inject Depth-Anything-V2 path into PYTHONPATH so "import depth_anything_v2" works
     env = dict(os.environ)
@@ -204,7 +210,10 @@ def main() -> None:
     ap.add_argument("--nv_preset", default="p5", help="NVENC preset p1..p7 (only if converter supports --nv_preset). Default: p5")
     ap.add_argument("--preview", action="store_true", help="Run converter in --preview mode (if supported).")
 
-    args = ap.parse_args()
+    args, extra = ap.parse_known_args()
+    # Forward any unrecognized args (e.g. --fp16) to the converter.
+    # Tip: you can also use `--` to separate test_install flags from converter flags.
+
 
     ffmpeg = which_or_die("ffmpeg")
 
@@ -247,6 +256,8 @@ def main() -> None:
         out_cq=args.out_cq,
         nv_preset=args.nv_preset,
         preview=args.preview,
+        converter_extra=extra,
+
     )
     t3 = time.perf_counter()
 

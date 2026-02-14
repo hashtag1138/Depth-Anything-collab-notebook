@@ -32,6 +32,8 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 
+from torch import amp
+
 from depth_anything_v2.dpt import DepthAnythingV2
 
 
@@ -291,97 +293,209 @@ def infer_depth_batch(
 ) -> torch.Tensor:
     """Infer depth for a batch of frames.
 
-    Returns: depth (B, H, W) float32 on CPU (so you can do min/max + smoothing cheaply).
+    Returns: depth (B, H, W) float32 on **GPU**.
 
-    Why CPU return? Because your smoothing is sequential and you already do min/max in numpy.
-    If you want even more speed, we can keep it on GPU and do reduction there.
+    Optimization: preprocessing (BGR->RGB, resize, normalize) is done on GPU in batch
+    to avoid OpenCV per-frame loops.
     """
     assert device == "cuda"
     B = len(frames_bgr)
+    if B == 0:
+        raise ValueError("Empty batch")
     H, W = frames_bgr[0].shape[:2]
-
-    # Build batch tensor: (B,3,S,S)
-    # We do resize on CPU (OpenCV) to keep code simple + predictable.
-    resized_rgb = []
     for f in frames_bgr:
         if f.shape[:2] != (H, W):
             raise ValueError("All frames in batch must have same size")
-        rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-        r = cv2.resize(rgb, (input_size, input_size), interpolation=cv2.INTER_CUBIC)
-        resized_rgb.append(r)
 
-    x = np.stack(resized_rgb, axis=0)  # B,S,S,3 uint8
-    x_t = torch.from_numpy(x).to(device=device, non_blocking=True)
-    # Keep the input in float32; use autocast for fp16/bf16 safely.
-    # Some DepthAnythingV2 checkpoints keep conv biases/weights in float32 and will error
-    # if you manually pass a float16 input outside an autocast context.
-    x_t = x_t.permute(0, 3, 1, 2).contiguous().to(dtype=torch.float32)
-    x_t = x_t / 255.0
+    # Stack once on CPU then transfer once to GPU: (B,H,W,3) uint8
+    x_np = np.stack(frames_bgr, axis=0)
+    x = torch.from_numpy(x_np).to(device=device, non_blocking=True)  # uint8
+    x = x.permute(0, 3, 1, 2).contiguous()  # (B,3,H,W)
+    x = x.to(dtype=torch.float32) / 255.0
+
+    # BGR -> RGB
+    x = x[:, [2, 1, 0], :, :]
+
+    # Resize to model input size on GPU (bicubic is closest to OpenCV INTER_CUBIC)
+    if (H, W) != (input_size, input_size):
+        x = F.interpolate(x, size=(input_size, input_size), mode="bicubic", align_corners=False)
 
     mean = _IMAGENET_MEAN.to(device=device, dtype=torch.float32)
     std = _IMAGENET_STD.to(device=device, dtype=torch.float32)
-    x_t = (x_t - mean) / std
+    x = (x - mean) / std
 
     # Forward
-    # DepthAnythingV2 forward typically returns (B,1,S,S) or (B,S,S); handle both.
     if use_fp16:
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            y = model(x_t)
+        with amp.autocast(device_type="cuda", dtype=torch.float16):
+            y = model(x)
     else:
-        y = model(x_t)
+        y = model(x)
+
     if y.dim() == 4 and y.shape[1] == 1:
         y = y[:, 0]
 
-    # Upsample back to original H,W
-    y = y.unsqueeze(1)  # B,1,S,S
+    # Upsample back to original H,W (still on GPU)
+    y = y.unsqueeze(1)  # (B,1,S,S)
     y = F.interpolate(y, size=(H, W), mode="bilinear", align_corners=False)
     y = y[:, 0]
+    return y.float()
 
-    return y.float().cpu()  # B,H,W float32
 
+
+# -------------------------
+# Depth post-process on GPU (normalize + temporal smoothing)
+# -------------------------
+
+@torch.no_grad()
+def normalize_and_smooth_depth_batch_gpu(
+    depths: torch.Tensor,            # (B,H,W) float32 on GPU
+    alpha: float,
+    prev_smooth: torch.Tensor | None # (H,W) float32 on GPU
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize each depth map to [0,1] and apply temporal smoothing on GPU.
+
+    - Normalization is per-frame: (d - min) / (max - min)
+    - Smoothing is sequential (in time order): smooth_t = alpha*prev + (1-alpha)*norm_t
+
+    Returns:
+      smooth_batch: (B,H,W) float32 on GPU
+      prev_out:     (H,W)   float32 on GPU (last frame's smooth)
+    """
+    if depths.dim() != 3:
+        raise ValueError(f"depths must be (B,H,W), got {tuple(depths.shape)}")
+    # Per-frame min/max on GPU
+    dmin = depths.amin(dim=(1, 2), keepdim=True)
+    dmax = depths.amax(dim=(1, 2), keepdim=True)
+    denom = (dmax - dmin).clamp_min(1e-6)
+    norm = (depths - dmin) / denom
+    norm = norm.clamp(0.0, 1.0)
+
+    B = norm.shape[0]
+    out = torch.empty_like(norm, dtype=torch.float32, device=norm.device)
+
+    prev = prev_smooth
+    a = float(alpha)
+    ia = 1.0 - a
+    for i in range(B):
+        cur = norm[i]
+        if prev is None:
+            sm = cur
+        else:
+            sm = (a * prev + ia * cur)
+        out[i] = sm
+        prev = sm
+    assert prev is not None
+    return out, prev
+
+
+
+
+# -------------------------
+# GPU contain+pad (eliminate per-frame OpenCV canvas building)
+# -------------------------
+
+@torch.no_grad()
+def contain_pad_batch_gpu(
+    frames_bgr_u8: list[np.ndarray],     # list of (H,W,3) uint8
+    depths_01_gpu: torch.Tensor,         # (B,H,W) float32 on GPU
+    eye_w: int,
+    eye_h: int,
+    use_fp16: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit each frame into (eye_w, eye_h) WITHOUT cropping (contain) on GPU.
+
+    Returns:
+      img_canvas:   (B,3,eye_h,eye_w) float16/float32 on GPU in range [0,255]
+      depth_canvas: (B,eye_h,eye_w)   float32 on GPU in range [0,1]
+    Padding: image=0, depth=1.0
+    """
+    if depths_01_gpu.dim() != 3:
+        raise ValueError(f"depths_01_gpu must be (B,H,W), got {tuple(depths_01_gpu.shape)}")
+    B, H, W = depths_01_gpu.shape
+
+    if len(frames_bgr_u8) != B:
+        raise ValueError(f"frames_bgr_u8 length {len(frames_bgr_u8)} != depths batch {B}")
+
+    # Stack frames once on CPU then transfer once to GPU.
+    frames_np = np.stack(frames_bgr_u8, axis=0)  # (B,H,W,3) uint8
+    img = torch.from_numpy(frames_np).to(device="cuda", non_blocking=True)  # uint8
+    img = img.permute(0, 3, 1, 2).contiguous()  # (B,3,H,W)
+    img = img.to(dtype=torch.float16 if use_fp16 else torch.float32)  # keep 0..255
+
+    # Compute contain scale once (all frames share same H/W within the batch)
+    scale = min(eye_w / float(W), eye_h / float(H))
+    new_w = max(1, int(round(W * scale)))
+    new_h = max(1, int(round(H * scale)))
+
+    # Resize on GPU
+    img_rs = F.interpolate(img, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    d = depths_01_gpu.unsqueeze(1)  # (B,1,H,W)
+    d_rs = F.interpolate(d, size=(new_h, new_w), mode="bilinear", align_corners=False)[:, 0]  # (B,new_h,new_w)
+
+    # Pad to center
+    x0 = (eye_w - new_w) // 2
+    y0 = (eye_h - new_h) // 2
+    pad_l = x0
+    pad_r = eye_w - new_w - x0
+    pad_t = y0
+    pad_b = eye_h - new_h - y0
+    if pad_l < 0 or pad_r < 0 or pad_t < 0 or pad_b < 0:
+        raise ValueError("contain_pad_batch_gpu: negative padding (check eye dims)")
+
+    img_c = F.pad(img_rs, (pad_l, pad_r, pad_t, pad_b), mode="constant", value=0.0)
+    depth_c = F.pad(d_rs, (pad_l, pad_r, pad_t, pad_b), mode="constant", value=1.0)
+
+    # Sanity
+    assert img_c.shape[-2:] == (eye_h, eye_w)
+    assert depth_c.shape[-2:] == (eye_h, eye_w)
+    return img_c, depth_c
 
 # -------------------------
 # Batch reprojection
 # -------------------------
 
 
+
 @torch.no_grad()
 def sbs_batch_from_canvas_depth_torch(
-    canvases_bgr_u8: np.ndarray,  # (B,H,W,3) uint8
-    depths_01: np.ndarray,        # (B,H,W) float32
+    img_canvas: torch.Tensor,       # (B,3,H,W) float16/float32 on GPU, range 0..255
+    depth_canvas_01: torch.Tensor,  # (B,H,W) float32 on GPU, range 0..1
     max_shift_px: int,
-    base_grid: torch.Tensor,      # (1,H,W,2)
+    base_grid: torch.Tensor,        # (1,H,W,2) on GPU
     px_to_norm: float,
-    use_fp16: bool,
 ) -> torch.Tensor:
     """GPU warp a batch into SBS frames.
 
     Returns: uint8 tensor on CPU with shape (B, H, 2W, 3).
     """
-    dev = "cuda"
-    B, H, W, _ = canvases_bgr_u8.shape
-    assert base_grid.shape[1] == H and base_grid.shape[2] == W
+    if img_canvas.dim() != 4:
+        raise ValueError(f"img_canvas must be (B,3,H,W), got {tuple(img_canvas.shape)}")
+    if depth_canvas_01.dim() != 3:
+        raise ValueError(f"depth_canvas_01 must be (B,H,W), got {tuple(depth_canvas_01.shape)}")
 
-    img_t = torch.from_numpy(canvases_bgr_u8).to(device=dev, non_blocking=True)
-    img_t = img_t.permute(0, 3, 1, 2).contiguous()  # B,3,H,W
-    img_t = img_t.to(dtype=torch.float16 if use_fp16 else torch.float32)
+    B, C, H, W = img_canvas.shape
+    if C != 3:
+        raise ValueError(f"img_canvas must have 3 channels, got {C}")
+    if base_grid.shape[1] != H or base_grid.shape[2] != W:
+        raise ValueError(f"base_grid is for {base_grid.shape[2]}x{base_grid.shape[1]} but got {W}x{H}")
 
-    depth_t = torch.from_numpy(depths_01).to(device=dev, non_blocking=True).to(dtype=torch.float32)  # B,H,W
+    depth_t = depth_canvas_01.to(dtype=torch.float32)
     half_px = ((1.0 - depth_t).clamp(0.0, 1.0) * float(max_shift_px)) * 0.5
-    dx = (half_px * px_to_norm).to(dtype=base_grid.dtype).unsqueeze(-1)  # B,H,W,1
+    dx = (half_px * float(px_to_norm)).to(dtype=base_grid.dtype).unsqueeze(-1)  # (B,H,W,1)
 
-    # Expand base grid to batch without allocating B copies of the full grid
-    # (expand is a view). Then we still need actual tensors to write into, so clone once.
-    grid = base_grid.expand(B, -1, -1, -1).clone()  # B,H,W,2
-    grid_l = grid
-    grid_r = grid.clone()
+    base_x = base_grid[..., 0].expand(B, -1, -1)  # (B,H,W) view
+    base_y = base_grid[..., 1].expand(B, -1, -1)  # (B,H,W) view
+    dx0 = dx[..., 0]  # (B,H,W)
 
-    grid_l[..., 0:1] = (grid_l[..., 0:1] + dx).clamp(-1.0, 1.0)
-    grid_r[..., 0:1] = (grid_r[..., 0:1] - dx).clamp(-1.0, 1.0)
+    x_l = (base_x + dx0).clamp(-1.0, 1.0)
+    x_r = (base_x - dx0).clamp(-1.0, 1.0)
 
-    left = F.grid_sample(img_t, grid_l, mode="bilinear", padding_mode="border", align_corners=True)
-    right = F.grid_sample(img_t, grid_r, mode="bilinear", padding_mode="border", align_corners=True)
-    sbs_t = torch.cat([left, right], dim=3)  # B,3,H,2W
+    grid_l = torch.stack((x_l, base_y), dim=-1)  # (B,H,W,2)
+    grid_r = torch.stack((x_r, base_y), dim=-1)  # (B,H,W,2)
+
+    left = F.grid_sample(img_canvas, grid_l, mode="bilinear", padding_mode="border", align_corners=True)
+    right = F.grid_sample(img_canvas, grid_r, mode="bilinear", padding_mode="border", align_corners=True)
+    sbs_t = torch.cat([left, right], dim=3)  # (B,3,H,2W)
 
     sbs_u8 = (
         sbs_t.clamp(0, 255)
@@ -391,6 +505,7 @@ def sbs_batch_from_canvas_depth_torch(
         .cpu()
     )
     return sbs_u8
+
 
 
 def main() -> None:
@@ -498,7 +613,7 @@ def main() -> None:
     assert writer.stdin is not None
 
     frame_bytes = src_w * src_h * 3
-    prev_smooth: np.ndarray | None = None
+    prev_smooth_gpu: torch.Tensor | None = None  # (H,W) float32 on GPU
 
     duration_s = ffprobe_duration(inp)
     total = estimate_total_frames(duration_s, fps_in=fps_in, preview=args.preview, preview_interval=args.preview_interval)
@@ -521,40 +636,31 @@ def main() -> None:
                 break
 
             # --- Depth in batch on GPU ---
-            depths = infer_depth_batch(model, frames, input_size=args.input_size, use_fp16=args.fp16, device="cuda")  # B,H,W CPU float32
+            depths_gpu = infer_depth_batch(
+                model, frames, input_size=args.input_size, use_fp16=args.fp16, device="cuda"
+            )  # (B,H,W) float32 on GPU
 
-            # --- Normalize + temporal smoothing (still sequential) ---
-            smooth_list: list[np.ndarray] = []
-            for i in range(len(frames)):
-                d = depths[i].numpy()
-                dmin, dmax = float(d.min()), float(d.max())
-                dn = (d - dmin) / (dmax - dmin + 1e-6)
-                if prev_smooth is None:
-                    smooth = dn.astype(np.float32)
-                else:
-                    smooth = (args.alpha * prev_smooth + (1.0 - args.alpha) * dn).astype(np.float32)
-                prev_smooth = smooth
-                smooth_list.append(smooth)
+            # --- Normalize + temporal smoothing on GPU (sequential over time, but no GPU↔CPU ping-pong) ---
+            smooth_gpu, prev_smooth_gpu = normalize_and_smooth_depth_batch_gpu(
+                depths_gpu, alpha=args.alpha, prev_smooth=prev_smooth_gpu
+            )  # (B,H,W) float32 on GPU
+            # --- GPU contain+pad to eye canvas (eliminates per-frame OpenCV canvas building) ---
+            img_canvas_t, depth_canvas_t = contain_pad_batch_gpu(
+    frames_bgr_u8=frames,
+    depths_01_gpu=smooth_gpu,
+    eye_w=eye_w,
+    eye_h=eye_h,
+    use_fp16=args.fp16,
+            )  # img: (B,3,eye_h,eye_w), depth: (B,eye_h,eye_w)
 
-            # --- Build canvases + depths for reprojection ---
-            canvases = []
-            depths_c = []
-            for f, sm in zip(frames, smooth_list):
-                canvas, depth_c = make_eye_canvas_and_depth(f, sm, eye_w=eye_w, eye_h=eye_h)
-                canvases.append(canvas)
-                depths_c.append(depth_c)
-
-            canvases_np = np.stack(canvases, axis=0)          # B,H,W,3
-            depths_c_np = np.stack(depths_c, axis=0).astype(np.float32)  # B,H,W
 
             # --- Batch reprojection on GPU ---
             sbs_batch_u8 = sbs_batch_from_canvas_depth_torch(
-                canvases_bgr_u8=canvases_np,
-                depths_01=depths_c_np,
+                img_canvas=img_canvas_t,
+                depth_canvas_01=depth_canvas_t,
                 max_shift_px=args.max_shift,
                 base_grid=base_grid,
                 px_to_norm=px_to_norm,
-                use_fp16=args.fp16,
             )  # (B,H,2W,3) uint8 CPU
 
             # Write to ffmpeg
