@@ -174,6 +174,15 @@ def resolve_models_selection(sel: str) -> list[str]:
             raise SystemExit(f"Unknown model '{p}'. Use: vits, vitb, vitl, all")
     return parts
 
+def ensure_ytdlp() -> None:
+    # run_job.py vérifie le binaire dans PATH, donc on s’assure qu’il existe.
+    if which("yt-dlp"):
+        print("✅ yt-dlp found.")
+        return
+    print("🟨 Installing yt-dlp (required for source.kind: ytdlp)...")
+    run([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
+    if not which("yt-dlp"):
+        raise SystemExit("yt-dlp still not found after install. Check PATH / environment.")
 
 def ensure_checkpoints(args: argparse.Namespace) -> None:
     wanted = resolve_models_selection(args.models)
@@ -221,6 +230,7 @@ def main() -> None:
     ensure_widgets(args)
     prepare_dirs()
     ensure_depth_repo(args)
+    ensure_ytdlp()
     ensure_checkpoints(args)
     smoke_test(args)
 
