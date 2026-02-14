@@ -47,6 +47,9 @@ DEFAULT_CQ = 18
 DEFAULT_NV_PRESET = "p6"  # p1 fastest .. p7 best
 DEFAULT_BATCH = 8
 
+DEFAULT_VIDEO_CODEC = "auto"  # auto|nvenc|x264
+DEFAULT_CRF = 28
+DEFAULT_X264_PRESET = "fast"
 MODEL_CONFIGS = {
     "vits": {"encoder": "vits", "features": 64,  "out_channels": [48, 96, 192, 384]},
     "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
@@ -57,6 +60,34 @@ MODEL_CONFIGS = {
 
 def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
+
+def ffmpeg_has_encoder(encoder: str) -> bool:
+    """Return True if ffmpeg reports the given encoder in `ffmpeg -encoders`. Cached."""
+    global _FFMPEG_ENCODERS_CACHE
+    if _FFMPEG_ENCODERS_CACHE is None:
+        try:
+            out = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], stderr=subprocess.STDOUT).decode("utf-8", errors="ignore")
+        except Exception:
+            out = ""
+        _FFMPEG_ENCODERS_CACHE = out
+    return encoder in _FFMPEG_ENCODERS_CACHE
+
+
+_FFMPEG_ENCODERS_CACHE: str | None = None
+
+
+def pick_video_encoder(requested: str) -> str:
+    """Resolve requested video encoder: auto -> nvenc if available else libx264."""
+    requested = (requested or "auto").lower()
+    if requested == "auto":
+        return "h264_nvenc" if ffmpeg_has_encoder("h264_nvenc") else "libx264"
+    if requested in {"nvenc", "h264_nvenc"}:
+        return "h264_nvenc"
+    if requested in {"x264", "libx264"}:
+        return "libx264"
+    # allow passing raw ffmpeg encoder names
+    return requested
+
 
 
 def ffprobe_fps(input_path: Path) -> float:
@@ -123,17 +154,53 @@ def open_ffmpeg_reader(input_path: Path, fps: float, preview: bool, preview_inte
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
 
 
-def open_ffmpeg_nvenc_writer(out_path: Path, fps_out: float, w: int, h: int, cq: int, nv_preset: str) -> subprocess.Popen:
-    cmd = [
+def open_ffmpeg_writer(
+    out_path: Path,
+    fps_out: float,
+    w: int,
+    h: int,
+    video_encoder: str,
+    *,
+    cq: int,
+    nv_preset: str,
+    crf: int,
+    x264_preset: str,
+) -> subprocess.Popen:
+    """Open an ffmpeg rawvideo->H.264 writer.
+
+    - If video_encoder == 'h264_nvenc': uses NVENC with --cq + preset (p1..p7)
+    - If video_encoder == 'libx264': uses x264 with -crf + preset (ultrafast..veryslow)
+
+    The output is MP4 yuv420p with faststart.
+    """
+    enc = video_encoder
+
+    base = [
         "ffmpeg", "-y", "-v", "error", "-nostdin",
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "-s:v", f"{w}x{h}",
         "-r", str(fps_out),
         "-i", "pipe:0",
-        "-c:v", "h264_nvenc",
-        "-preset", nv_preset,
-        "-cq", str(int(cq)),
+    ]
+
+    if enc == "h264_nvenc":
+        cmd = base + [
+            "-c:v", "h264_nvenc",
+            "-preset", nv_preset,
+            "-cq", str(int(cq)),
+        ]
+    elif enc == "libx264":
+        cmd = base + [
+            "-c:v", "libx264",
+            "-preset", x264_preset,
+            "-crf", str(int(crf)),
+        ]
+    else:
+        # Best-effort: pass through encoder name without extra quality flags
+        cmd = base + ["-c:v", enc]
+
+    cmd += [
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(out_path),
@@ -176,32 +243,32 @@ def build_base_grid(eye_h: int, eye_w: int, device: str, dtype: torch.dtype) -> 
 
 
 def make_eye_canvas_and_depth(img_bgr: np.ndarray, depth_01: np.ndarray, eye_w: int, eye_h: int) -> tuple[np.ndarray, np.ndarray]:
-    """Center/letterbox/crop to (eye_h, eye_w). Matches your earlier behavior."""
+    """Fit input into (eye_w, eye_h) WITHOUT cropping (contain).
+    - Resizes with preserved aspect ratio
+    - Pads with black (image) / 1.0 (depth) to center
+    This avoids the 'zoom' effect caused by center-cropping wide inputs.
+    """
     h, w = img_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Invalid frame size: {w}x{h}")
 
-    canvas = np.zeros((eye_h, w, 3), dtype=np.uint8)
-    depth_c = np.ones((eye_h, w), dtype=np.float32)
-    y0 = (eye_h - h) // 2
-    if y0 < 0:
-        crop_y = -y0
-        img2 = img_bgr[crop_y:crop_y + eye_h, :, :]
-        d2 = depth_01[crop_y:crop_y + eye_h, :]
-        canvas[:, :, :] = img2
-        depth_c[:, :] = d2
-    else:
-        canvas[y0:y0 + h, :, :] = img_bgr
-        depth_c[y0:y0 + h, :] = depth_01
+    # Scale to fit inside the target (contain)
+    scale = min(eye_w / w, eye_h / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
 
-    if w >= eye_w:
-        x0 = (w - eye_w) // 2
-        canvas = canvas[:, x0:x0 + eye_w, :]
-        depth_c = depth_c[:, x0:x0 + eye_w]
-    else:
-        pad = eye_w - w
-        lp = pad // 2
-        rp = pad - lp
-        canvas = cv2.copyMakeBorder(canvas, 0, 0, lp, rp, cv2.BORDER_CONSTANT, value=(0, 0, 0))
-        depth_c = np.pad(depth_c, ((0, 0), (lp, rp)), mode="constant", constant_values=1.0)
+    interp_img = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    img_rs = cv2.resize(img_bgr, (new_w, new_h), interpolation=interp_img)
+    d_rs = cv2.resize(depth_01, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    canvas = np.zeros((eye_h, eye_w, 3), dtype=np.uint8)
+    depth_c = np.ones((eye_h, eye_w), dtype=np.float32)
+
+    x0 = (eye_w - new_w) // 2
+    y0 = (eye_h - new_h) // 2
+
+    canvas[y0:y0 + new_h, x0:x0 + new_w, :] = img_rs
+    depth_c[y0:y0 + new_h, x0:x0 + new_w] = d_rs
 
     return canvas, depth_c
 
@@ -337,8 +404,8 @@ def main() -> None:
     ap.add_argument("--max_shift", type=int, default=DEFAULT_MAX_SHIFT)
     ap.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
 
-    ap.add_argument("--sbs_w", type=int, default=SBS_W)
-    ap.add_argument("--sbs_h", type=int, default=SBS_H)
+    ap.add_argument("--sbs_w", type=int, default=SBS_W, help="Output SBS width (total, both eyes). Each eye is sbs_w/2.")
+    ap.add_argument("--sbs_h", type=int, default=None, help="Output SBS height. Default: auto from input aspect ratio so each eye matches the input video.")
 
     ap.add_argument("--upscale", action="store_true", help=f"Upscale frames to {UPSCALE_W}x{UPSCALE_H} before depth")
     ap.add_argument("--up_w", type=int, default=UPSCALE_W)
@@ -352,6 +419,11 @@ def main() -> None:
 
     ap.add_argument("--fp16", action="store_true", help="Use fp16 for depth+reprojection (recommended)")
     ap.add_argument("--batch", type=int, default=DEFAULT_BATCH, help="Batch size for depth+reprojection")
+
+    ap.add_argument("--video_codec", type=str, default=DEFAULT_VIDEO_CODEC,
+                    help="Video encoder: auto|nvenc|x264. auto picks nvenc if available, else libx264")
+    ap.add_argument("--crf", type=int, default=DEFAULT_CRF, help="x264 CRF (used if libx264 is selected)")
+    ap.add_argument("--x264_preset", type=str, default=DEFAULT_X264_PRESET, help="x264 preset (ultrafast..veryslow)")
 
     ap.add_argument("--cq", type=int, default=DEFAULT_CQ, help="NVENC constant quality (roughly like CRF)")
     ap.add_argument("--nv_preset", type=str, default=DEFAULT_NV_PRESET, help="NVENC preset p1..p7")
@@ -371,7 +443,24 @@ def main() -> None:
     fps_out = (1.0 / args.preview_interval) if args.preview else fps_in
     src_w, src_h = ffprobe_wh(inp)
 
-    eye_w, eye_h = args.sbs_w // 2, args.sbs_h
+    def _even(x: int) -> int:
+        return x if (x % 2) == 0 else (x - 1)
+
+    # Auto-pick sbs_h so that each eye matches the input aspect ratio (no forced "tall eye" frame).
+    # If the user provides --sbs_h, we respect it.
+    eye_w = args.sbs_w // 2
+    if args.sbs_h is None:
+        auto_eye_h = int(round(eye_w * (src_h / src_w)))
+        auto_eye_h = max(2, auto_eye_h)
+        eye_h = _even(auto_eye_h)
+        args.sbs_h = eye_h
+    else:
+        eye_h = args.sbs_h
+
+    # Enforce even dimensions (more compatible with H.264 / NVENC)
+    args.sbs_w = _even(args.sbs_w)
+    args.sbs_h = _even(args.sbs_h)
+    eye_w = args.sbs_w // 2
     out_no_audio = out.with_suffix(".noaudio.mp4")
 
     print("[1] Load Depth Anything V2 model")
@@ -390,7 +479,22 @@ def main() -> None:
     assert reader.stdout is not None
 
     print("[3] Open ffmpeg NVENC writer (pipe)")
-    writer = open_ffmpeg_nvenc_writer(out_no_audio, fps_out=fps_out, w=args.sbs_w, h=args.sbs_h, cq=args.cq, nv_preset=args.nv_preset)
+    video_encoder = pick_video_encoder(args.video_codec)
+    if video_encoder == "h264_nvenc" and not ffmpeg_has_encoder("h264_nvenc"):
+        print("[WARN] Requested NVENC but ffmpeg doesn't expose h264_nvenc; falling back to libx264", file=sys.stderr)
+        video_encoder = "libx264"
+
+    writer = open_ffmpeg_writer(
+        out_no_audio,
+        fps_out=fps_out,
+        w=args.sbs_w,
+        h=args.sbs_h,
+        video_encoder=video_encoder,
+        cq=args.cq,
+        nv_preset=args.nv_preset,
+        crf=args.crf,
+        x264_preset=args.x264_preset,
+    )
     assert writer.stdin is not None
 
     frame_bytes = src_w * src_h * 3

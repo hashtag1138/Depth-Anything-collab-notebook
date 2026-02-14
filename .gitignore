@@ -17,3 +17,9 @@ dist/
 build/
 *.egg-info/
 
+# test files and stuff
+calib_videos/
+calib_videos_out/
+test_install/
+
+
