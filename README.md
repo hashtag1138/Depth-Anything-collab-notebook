@@ -1,4 +1,4 @@
-# Depth-Anything Colab Notebook — Mono → SBS (Pico 4 / VR)
+# Depth-Anything Colab Notebook — Mono → SBS (Pico 4/ Quest / VR)
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hashtag1138/Depth-Anything-collab-notebook/blob/main/DepthAnything-Collab-Notebook.ipynb)
 
@@ -25,7 +25,7 @@ Résultat : une vidéo `*_sbs.mp4` lisible sur un casque VR (lecture via un play
 - `DepthAnything-Collab-Notebook.ipynb` : notebook Colab (installation + exécution)
 - `install_collab.py` : install “light” pour Colab (ffmpeg + clone Depth-Anything-V2 + checkpoints + dossiers)
 - `install.py` : install local Linux (venv + deps + clone Depth-Anything-V2 + checkpoints)
-- `mono_to_sbs_pico4_v2_autosize.py` : converter principal (mono → SBS)
+- `mono_to_sbs_4_v2_autosize.py` : converter principal (mono → SBS)
 - `new_job.py` : assistant interactif pour créer des jobs YAML
 - `run_job.py` : runner qui exécute une file de jobs YAML (local ou ytdlp)
 - `test_install.py` : smoke test avec progression et auto-détection des flags supportés
@@ -55,7 +55,7 @@ Résultat : une vidéo `*_sbs.mp4` lisible sur un casque VR (lecture via un play
 3. Conversion (exemple) :
 
 ```bash
-!python mono_to_sbs_pico4_v2_autosize.py input.mp4 output_sbs.mp4   --encoder vitb   --sbs_w 3840 --sbs_h 2160   --max_shift 24 --alpha 0.90   --input_size 518   --batch 8   --fp16
+!python mono_to_sbs_4_v2_autosize.py input.mp4 output_sbs.mp4   --encoder vitb   --sbs_w 3840 --sbs_h 2160   --max_shift 24 --alpha 0.90   --input_size 518   --batch 8   --fp16
 ```
 
 > Astuce Colab : commence en `--preview` pour valider le rendu rapidement, puis relance en full.
@@ -78,7 +78,7 @@ source .venv/bin/activate
 #### 2) Convertir une vidéo (mode direct)
 
 ```bash
-python mono_to_sbs_pico4_v2_autosize.py input.mp4 output_sbs.mp4   --encoder vitb   --sbs_w 3840 --sbs_h 2160   --max_shift 24 --alpha 0.90   --input_size 518   --batch 8   --video_codec auto
+python mono_to_sbs_4_v2_autosize.py input.mp4 output_sbs.mp4   --encoder vitb   --sbs_w 3840 --sbs_h 2160   --max_shift 24 --alpha 0.90   --input_size 518   --batch 8   --video_codec auto
 ```
 
 `--video_codec auto` choisit NVENC si disponible (`h264_nvenc`), sinon `libx264`.
@@ -109,7 +109,7 @@ Le runner :
 
 ---
 
-## Recettes de réglages (2K / 4K / Pico4 / Preview)
+## Recettes de réglages (2K / 4K / Pico4 / Quest / Preview)
 
 > Idée générale : **valider vite**, puis monter en qualité.  
 > Les valeurs ci-dessous sont des “presets” pratiques (à adapter).
@@ -178,7 +178,7 @@ python mono_to_sbs_pico4_v2_autosize.py input.mp4 output_comfort_sbs.mp4   --enc
 ## Crédits
 
 - Modèle de profondeur : **Depth Anything V2** (repo officiel)
-- Ce repo : scripts + notebook d’orchestration pour conversion mono → SBS orientée VR (Pico 4)
+- Ce repo : scripts + notebook d’orchestration pour conversion mono → SBS orientée VR (Pico 4 / Quest)
 
 ---
 
@@ -190,7 +190,7 @@ Le cerveau tolère assez mal une parallaxe “trop forte” (surtout sur des sc�
 
 ## 🇬🇧 EN
 
-This repo provides a **Google Colab notebook** + **Python scripts** to convert a **mono** video into a **SBS (Side‑By‑Side)** VR‑friendly video (e.g. Pico 4), using **Depth Anything V2** to estimate per‑frame depth and reproject the image (left eye / right eye).
+This repo provides a **Google Colab notebook** + **Python scripts** to convert a **mono** video into a **SBS (Side‑By‑Side)** VR‑friendly video (e.g. Pico 4 / Quest), using **Depth Anything V2** to estimate per‑frame depth and reproject the image (left eye / right eye).
 
 > ⚠️ Status: experimental / personal “working pipeline”.
 > Performance and parameters (shift, alpha, input_size, batch…) must be tuned to your videos and GPU.
@@ -228,7 +228,7 @@ Same files as listed in the French section (notebook, installers, converter, job
 - Create a job YAML: `python new_job.py`
 - Run pending jobs: `python run_job.py`
 
-### Tuning recipes (2K / 4K / Pico4 / Preview)
+### Tuning recipes (2K / 4K / Pico4 / Quest / Preview)
 
 See the French “Recettes de réglages” section: the commands are the same and can be used as presets.
 
